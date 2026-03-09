@@ -4,6 +4,106 @@
 
 ---
 
+## Executive Summary
+
+smart-grep exists to solve a specific failure mode in modern software work: exact-match tools are excellent when you already know the right string, but they fail when you only know the **intent** of the code you are looking for. That gap hurts both humans and agents. Humans miss existing implementations and re-build logic that is already present. Agents waste tokens and time scanning broad swaths of a repository because they have no cheap way to ask, "what code is *about* payment retries, auth enforcement, or rate limiting?"
+
+The project goal is therefore not just to build "semantic grep," but to create a **local semantic retrieval layer for codebases** that is fast, inspectable, cheap to run, and trustworthy enough to become part of the default development workflow. The end-state is a single Rust binary that can index a repository locally, answer meaning-based queries in milliseconds, and expose those results both to terminal users and to agent environments via MCP.
+
+This plan deliberately goes beyond a feature checklist. It captures:
+- the product problem being solved,
+- the technical architecture chosen to solve it,
+- the sequencing logic that determines implementation order,
+- the trade-offs behind each major subsystem,
+- and the set of advanced capabilities unlocked once the base semantic index exists.
+
+That sequencing matters. Many of the more impressive capabilities in this plan — semantic diff, stale logic detection, semantic coverage, codebase map, time-travel search, session memory, MCP-native workflows — are not separate products. They are **second-order features** built on the same core primitives:
+1. good AST-based chunks,
+2. normalized embedding text,
+3. reliable local embeddings,
+4. durable metadata + vectors in local storage,
+5. fast nearest-neighbor retrieval,
+6. and enough provenance/graph/context data to make higher-level analyses trustworthy.
+
+In other words: the semantic index is the platform. Search is only the first visible feature on top of it.
+
+## How to Read This Plan
+
+This document is intentionally written for a future contributor or agent who may join the project long after the original design discussions are gone. It should be possible to execute the work from this plan without guessing at the underlying intent.
+
+Use the document in four passes:
+
+1. **Product framing** (`Vision`, `Problem Statement`, `Goals`) explains what the tool is for and what success looks like.
+2. **Architecture and data model** (`Architecture`, `File Structure`, `Data Structures`, `Traits`, `Schema`) explains the load-bearing implementation choices.
+3. **Feature design sections** explain why each capability exists, what it depends on, and how it composes with the rest of the system.
+4. **Implementation Phases** convert the design into execution order. These phases are the bridge from planning to issue tracking.
+
+When turning this plan into a backlog, prioritize **dependency truth over document order**. Some sections appear later because they are conceptually advanced, but they may still share prerequisites with earlier sections. The backlog should therefore mirror what can be built and validated incrementally, not just the chapter numbering of this document.
+
+## Planning Principles and Dependency Logic
+
+The project should be implemented according to the following principles:
+
+### 1. Build the vertical slice first
+The first meaningful milestone is not "all parsers" or "all commands." It is a small but complete path:
+- discover files,
+- extract coherent chunks,
+- generate embeddings,
+- persist metadata + vectors,
+- run a query,
+- and show ranked results.
+
+If that vertical slice is weak, every downstream feature inherits the weakness. If it is strong, many advanced features become straightforward additions rather than speculative research.
+
+### 2. Optimize for correctness before elegance
+For v1, correctness and transparency matter more than asymptotic cleverness. Examples:
+- rebuilding HNSW after mutations is acceptable if it is correct and operationally simple;
+- approximate token counting is acceptable if it is stable and predictable;
+- a limited but well-tested language set is better than broad, shallow parser coverage.
+
+### 3. Treat the semantic index as infrastructure
+The most important mindset for implementation is that indexing is not a one-off precomputation step. It is the foundational infrastructure that every later command depends on. Decisions in chunking, normalization, schema design, and model metadata affect search quality, incremental correctness, explainability, and future feature feasibility.
+
+### 4. Keep the system local and inspectable
+A core promise of smart-grep is that users can trust it operationally:
+- no network dependency at search time,
+- no opaque hosted service,
+- inspectable SQLite state,
+- explicit model metadata,
+- explainable ranking signals,
+- and predictable failure modes.
+
+### 5. Sequence features by leverage
+Not all features provide equal leverage.
+
+**High-leverage early work:**
+- workspace bootstrap,
+- schema and core types,
+- chunking quality,
+- embedding-text normalization,
+- search CLI,
+- evaluation fixtures.
+
+**High-value but downstream work:**
+- hybrid BM25 reranking,
+- query expansion,
+- graph expansion,
+- sessions,
+- confidence calibration,
+- snapshots,
+- intelligence features.
+
+**Late polish / integration work:**
+- MCP server mode,
+- self-index bundling,
+- docs/install polish,
+- release automation.
+
+### 6. Preserve future optionality without over-engineering
+The crate boundaries, traits, and schema should preserve room for later model swaps, new languages, online ANN updates, and richer analysis. But the implementation should not pay complexity costs for hypothetical needs before the MVP proves itself.
+
+---
+
 ## Table of Contents
 
 1. [Vision](#1-vision)
@@ -3084,9 +3184,38 @@ The key success criterion: smart-grep must return relevant results that ripgrep 
 
 ## 46. Implementation Phases
 
+This section is the execution spine of the entire project. The earlier sections describe the system in terms of architecture and capability; this section explains the intended **order of construction**.
+
+The phases are designed around dependency compression:
+- each phase should unlock the maximum amount of downstream work,
+- each phase should leave the repository in a testable, demonstrable state,
+- and each phase should reduce uncertainty before the next phase adds scope.
+
+A useful mental model is:
+- **Phase 1** proves the idea,
+- **Phase 2** creates the durable foundation,
+- **Phase 3** makes it operationally practical,
+- **Phase 4** expands breadth and analytical power,
+- **Phase 5** integrates the system into agent workflows and hardens it for real use.
+
+When converting these phases into implementation issues, create dependencies based on technical prerequisites, not just chronology. For example, `graph.rs` should block `--from` and `--expand`; snapshot support should block semantic diff and stale detection; clustering should block map-driven orientation and some confidence/session enhancements.
+
 ### Phase 1 — POC: Node.js (1 day)
 
 **Goal**: Validate the concept before writing any Rust. Prove the core value proposition with minimal code.
+
+**Why this phase exists**: The POC is not throwaway busywork. Its job is to answer the most important strategic question as cheaply as possible: does AST chunking plus local embeddings actually surface meaning-based results that exact-match tools miss? If the answer is no, the project should pivot before investing in a full Rust architecture. If the answer is yes, the Rust implementation can proceed with confidence and with concrete evaluation examples.
+
+**What this phase should settle**:
+- whether the normalized `embedding_text` format materially improves retrieval over raw source embedding,
+- whether natural-language queries can retrieve conceptually correct chunks even when exact keywords are absent,
+- whether query-by-example is compelling enough to be treated as a first-class feature rather than a later add-on,
+- and which test fixtures and benchmark queries should be carried forward into the Rust implementation as permanent evaluation assets.
+
+**What this phase should not do**:
+- become a parallel production implementation,
+- accumulate infrastructure that duplicates the eventual Rust system,
+- or expand into broad language support beyond what is needed to prove the idea.
 
 - [ ] `tree-sitter` parse JS/TS into AST chunks (functions and classes, not line windows)
 - [ ] `fastembed` local embedding via `@xenova/transformers` (Xenova/all-MiniLM-L6-v2)
@@ -3105,6 +3234,16 @@ The key success criterion: smart-grep must return relevant results that ripgrep 
 ### Phase 2 — Rust Foundations + Searchable MVP (3–4 days)
 
 **Goal**: reliable end-to-end vertical slice — index one language, search it.
+
+**Why this phase exists**: This is the load-bearing phase. It turns the concept into durable infrastructure. The output of this phase is not merely "a CLI that works"; it is the first trustworthy semantic index implementation with persistent storage, query execution, and result presentation. Nearly every later feature depends on the choices made here.
+
+**Design intent**:
+- establish the crate boundaries early so ownership of responsibilities stays clear,
+- define the shared data model before feature code proliferates,
+- ship the smallest useful end-to-end search experience before layering on sophistication,
+- and preserve inspectability so ranking/debugging problems are diagnosable rather than mysterious.
+
+**Success bar for Phase 2**: a contributor should be able to point smart-grep at a small repository, build a local index, run a natural-language query, and receive results that are visibly better than exact-match search for intent-based questions. That is the first moment the project becomes real.
 
 **Workspace setup:**
 - [ ] Set up workspace with 4 crates + shared types in `crates/indexer/src/lib.rs`
@@ -3146,6 +3285,15 @@ The key success criterion: smart-grep must return relevant results that ripgrep 
 
 ### Phase 3 — Incremental Indexing + Graph + Sessions (1–2 days)
 
+**Why this phase exists**: A semantic search tool is only viable for daily use if re-indexing is cheap enough to be routine and if retrieval can move beyond isolated chunks into surrounding execution context. This phase therefore upgrades the MVP from "works" to "practical." It also introduces the first set of features whose power comes from relationships between chunks rather than chunk embeddings alone.
+
+**Three major capabilities unlocked here**:
+1. **Incremental correctness** — only changed files are recomputed, making the tool cheap to keep fresh.
+2. **Graph-aware retrieval** — search results can be scoped or expanded along call relationships, reducing noise in large repositories.
+3. **Investigation workflows** — sessions and multi-query fan-out let an agent or human accumulate understanding over multiple searches instead of treating each query as stateless.
+
+**Reason for sequencing**: These features come after the MVP because they depend on stable chunk IDs, persistent storage semantics, and a trustworthy query path. Implementing them earlier would increase complexity before the base system is validated.
+
 - [ ] `blake3` content hashing for incremental skip detection
 - [ ] Incremental file state transitions: new/changed/deleted/unchanged
 - [ ] Snapshot `prev_vector` before each re-index of changed chunks
@@ -3163,6 +3311,14 @@ The key success criterion: smart-grep must return relevant results that ripgrep 
 ---
 
 ### Phase 4 — Multi-language + Codebase Intelligence (2–3 days)
+
+**Why this phase exists**: Once the core semantic pipeline is stable, the highest-leverage expansion is not random feature accretion but broader repository coverage and higher-order analyses that reuse the same index. This is where smart-grep starts to differentiate itself from being merely a semantic search CLI and becomes a semantic understanding tool for whole codebases.
+
+**Two goals are combined intentionally in this phase**:
+- **Breadth**: support the target v1 language set well enough to prove cross-language value.
+- **Intelligence**: expose analyses that are only possible because the embedding index, metadata, and graph/snapshot machinery already exist.
+
+This is the phase where the project starts to compound. Clustering enables codebase maps. Snapshotting enables time-travel and semantic diff. Test tagging enables semantic coverage. High-similarity neighbor analysis enables lint-like quality signals. These are not isolated features; they are multiplicative uses of the same indexed substrate.
 
 - [ ] Python and Ruby `ChunkExtractor` implementations with full test coverage
 - [ ] Per-language integration tests with `test-fixtures/`
@@ -3183,6 +3339,16 @@ The key success criterion: smart-grep must return relevant results that ripgrep 
 ---
 
 ### Phase 5 — MCP Server + Self-Index + Polish (1–2 days)
+
+**Why this phase exists**: The final phase makes smart-grep easy to adopt, easy to trust, and easy to integrate into agent-centric workflows. By this point the core engine should already exist. The work here is about packaging that capability so it can be consumed naturally by terminals, automation, and MCP-compatible tools.
+
+**Key intent**:
+- make the tool feel native inside Claude Code and similar environments,
+- preserve all the work already invested in search quality by exposing it through a stable machine interface,
+- provide zero-setup demonstration value via `--self`,
+- and close the loop on operational polish so installation, health-checking, and documentation are not afterthoughts.
+
+This phase should avoid destabilizing core retrieval behavior. It is primarily integration and productization work, not a reason to reopen foundational architectural choices unless an integration surface reveals a true gap.
 
 - [ ] `smart-grep serve` — MCP server (stdio + HTTP/SSE) with full 8-tool surface
 - [ ] Wire all MCP tools to existing handlers (search, multi, context, map, stale, session, coverage)
@@ -3254,6 +3420,48 @@ smart-grep map
 ```
 
 ---
+
+## 47.1 Dependency Overlay for Backlog Planning
+
+This section exists to make backlog generation explicit. The feature chapters above describe capabilities, but issue tracking needs a graph.
+
+### Foundational dependency chain
+
+1. **Workspace bootstrap**
+   - Blocks all Rust implementation work.
+   - Includes root workspace config, crate layout, shared dependencies, fixture directories, and test skeletons.
+
+2. **Shared contracts and storage foundations**
+   - Blocks most downstream crates.
+   - Includes core types, traits, schema, DB open/migrate logic, and HNSW wrapper shape.
+
+3. **Base indexing pipeline**
+   - Blocks all search and intelligence features.
+   - Includes file discovery, language dispatch, chunk extraction, embedding text normalization, embedding generation, and storage writes.
+
+4. **Searchable MVP path**
+   - Blocks quality, graph, session, and MCP features.
+   - Includes query embedding, nearest-neighbor retrieval, result formatting, CLI search/index entry points, and basic JSON output.
+
+### Secondary dependency clusters
+
+- **Graph extraction** blocks `--expand`, `--from`, and parts of stale/session/context features.
+- **Incremental indexing + prev-vector support** blocks semantic diff and stale logic detection.
+- **Test tagging + stable retrieval** block semantic coverage.
+- **BM25 + hybrid scoring** should precede confidence tuning and `--why` output because the explanation surface depends on ranking components.
+- **Clustering** blocks `smart-grep map` and supports confidence suggestions and session exploration hints.
+- **Snapshot infrastructure** blocks `--at` historical search and snapshot-backed diff workflows.
+- **Stable CLI handlers** block MCP server wiring because the MCP surface should reuse existing command handlers, not fork them.
+- **Release/install polish** should come after the command surface and JSON output stabilize.
+
+### Practical implication for issue creation
+
+When this plan is converted into Beads:
+- top-level epics should reflect major delivery streams,
+- child tasks should reflect implementable units,
+- and dependencies should model the prerequisites above rather than relying on humans to infer order from prose.
+
+The backlog should make it obvious which work is ready now, which work is blocked by foundations, and which advanced features are intentionally downstream of the MVP.
 
 ## 48. Timeline
 
